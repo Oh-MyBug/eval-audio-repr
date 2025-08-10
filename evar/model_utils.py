@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import torch
 from torch import nn
+import numpy as np
 
 
 def ensure_weights(filename, url):
@@ -80,6 +81,28 @@ def initialize_layers(layer):
             logging.debug(f' initialize {layer}.bias')
             layer.bias.data.fill_(0.)
 
+##########################################################################################
+# compute a list of chebyshev polynomials from T_0 to T_{K-1} ############################
+
+def cheb_polynomial(L_tilde, K):
+    '''
+    compute a list of chebyshev polynomials from T_0 to T_{K-1}
+    ----------
+    Parameters
+    L_tilde: scaled Laplacian, np.ndarray, shape (N, N)
+    K: the maximum order of chebyshev polynomials
+    ----------
+    Returns
+    cheb_polynomials: list(np.ndarray), length: K, from T_0 to T_{K-1}
+    '''
+    N = L_tilde.shape[0]
+    cheb_polynomials = np.array([np.identity(N), L_tilde.copy()])
+    for i in range(2, K):
+        cheb_polynomials = np.append(
+            cheb_polynomials,
+            [2 * L_tilde * cheb_polynomials[i - 1] - cheb_polynomials[i - 2]],
+            axis=0)
+    return cheb_polynomials
 
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_sizes, output_size, hidden_dropout=0.5, mean=0.0, std=0.01, bias=0.):

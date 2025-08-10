@@ -8,7 +8,7 @@ https://arxiv.org/abs/2305.14079
 """
 
 from evar.ar_base import BaseAudioRepr, BaseCLAP, calculate_norm_stats, normalize_spectrogram
-import torch
+import torch 
 import logging
 
 try:
@@ -66,7 +66,9 @@ class AR_M2D(BaseAudioRepr):
             x = self.encode_frames_lms(batch_audio)
         else:
             x = self.encode_frames(batch_audio)
-        return x.mean(dim=-1) # [B, D, T] -> [B, D]
+        # print("x.shape: ", x.shape)
+        # return x.mean(dim=-1) # [B, D, T] -> [B, D]
+        return x
 
     def encode_frames_lms(self, batch_lms):
         x = normalize_spectrogram(self.norm_stats, batch_lms)

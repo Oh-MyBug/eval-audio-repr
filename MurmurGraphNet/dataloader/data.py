@@ -3,16 +3,19 @@
 Balanced sampler is supported for multi-label tasks.
 """
 
-from .common import (np, pd, torch, F, Path)
-from .sampler import BalancedRandomSampler, InfiniteSampler
-from sklearn.preprocessing import MultiLabelBinarizer
-from torch.utils.data import WeightedRandomSampler
+import os
+import torch
+import random
 import librosa
 import logging
-import os
-import random
-from collections import defaultdict
+import numpy as np
+import pandas as pd
+import torch.nn.functional as F
 
+from pathlib import Path
+from torch.utils.data import WeightedRandomSampler
+from sklearn.preprocessing import MultiLabelBinarizer
+from MurmurGraphNet.dataloader.sampler import BalancedRandomSampler, InfiniteSampler
 
 class BaseRawAudioDataset(torch.utils.data.Dataset):
     def __init__(self, unit_samples, tfms=None, random_crop=False, return_filename=False):
@@ -56,8 +59,13 @@ class BaseRawAudioDataset(torch.utils.data.Dataset):
 
 class WavDataset_paired(BaseRawAudioDataset):
     """
-    Multi-position heart sound dataset with missing position handling.
-    Each sample returns 4 positions (MV, AV, PV, TV) with mask indicating availability.
+    Multi-position heart sound dataset returning (wav, label) format.
+    wav shape: (5, unit_samples) where:
+    - wav[0] = MV audio
+    - wav[1] = AV audio  
+    - wav[2] = PV audio
+    - wav[3] = TV audio
+    - wav[4] = mask channel (segmented mask info)
     """
     
     POSITIONS = ['MV', 'AV', 'PV', 'TV']
@@ -89,10 +97,6 @@ class WavDataset_paired(BaseRawAudioDataset):
     def _build_patient_segments_mapping(self):
         """Build mapping from patient_id to {position: [file_paths]} from CSV"""
         
-        # ❌ 不能序列化的lambda
-        # self.patient_segments = defaultdict(lambda: {pos: [] for pos in self.POSITIONS})
-        
-        # ✅ 替换成普通字典
         self.patient_segments = {}
         self.patient_labels = {}
         
@@ -118,7 +122,7 @@ class WavDataset_paired(BaseRawAudioDataset):
             # Build full file path
             full_path = os.path.join(self.cfg.task_data, file_name.replace('\\', '/'))
             
-            # ✅ 手动初始化字典结构
+            # Initialize dict structure if needed
             if patient_id not in self.patient_segments:
                 self.patient_segments[patient_id] = {pos: [] for pos in self.POSITIONS}
             
@@ -242,16 +246,18 @@ class WavDataset_paired(BaseRawAudioDataset):
             return None
     
     def get_audio(self, index):
-        """Override base method - not used in multi-position version"""
-        raise NotImplementedError("Use get_multiposition_audio instead")
-        
-    def get_multiposition_audio(self, index):
-        """Get audio data for all 4 positions with missing position handling"""
+        """
+        Override base method to return multi-position audio with mask.
+        Returns: (5, unit_samples) tensor where:
+        - First 4 channels: [MV, AV, PV, TV] audio data
+        - 5th channel: mask information segmented across time dimension
+        """
         patient_id, combo_id = self.samples[index]
         
-        audio_data = {}
-        mask = []
+        position_audios = []
+        mask_values = []
         
+        # Process each position
         for position in self.POSITIONS:
             wav = self.get_audio_for_position(patient_id, position)
             
@@ -263,172 +269,116 @@ class WavDataset_paired(BaseRawAudioDataset):
                     wav = wav[start:start + self.unit_samples]
                 elif l < self.unit_samples:
                     wav = F.pad(wav, (0, self.unit_samples - l), mode='constant', value=0)
-                    
-                audio_data[position] = wav
-                mask.append(1.0)
-                
+                mask_values.append(1.0)  # Available
             else:
                 # Handle missing position
                 if self.missing_strategy == 'zero_fill':
-                    audio_data[position] = torch.zeros(self.unit_samples)
+                    wav = torch.zeros(self.unit_samples)
                 elif self.missing_strategy == 'mask_token':
-                    audio_data[position] = torch.full((self.unit_samples,), -999.0)  # Special value
+                    wav = torch.full((self.unit_samples,), -999.0)  # Special value for missing
                 else:
-                    audio_data[position] = torch.zeros(self.unit_samples)
-                    
-                mask.append(0.0)
+                    wav = torch.zeros(self.unit_samples)
+                mask_values.append(0.0)  # Missing
+            
+            position_audios.append(wav)
         
-        # Apply transforms if specified
-        if self.tfms is not None:
-            for i, position in enumerate(self.POSITIONS):
-                if mask[i] > 0:  # Only transform real audio
-                    audio_data[position] = self.tfms(audio_data[position])
+        # ✅ Create mask channel with segmented mask information
+        mask_channel = torch.zeros(self.unit_samples)
+        segment_length = self.unit_samples // 4
         
-        return audio_data, torch.tensor(mask, dtype=torch.float32)
+        for i, mask_val in enumerate(mask_values):
+            start_idx = i * segment_length
+            # Handle the last segment to cover remaining samples
+            end_idx = (i + 1) * segment_length if i < 3 else self.unit_samples
+            mask_channel[start_idx:end_idx] = mask_val
+        
+        # Add mask channel to audio data
+        position_audios.append(mask_channel)
+        
+        # Stack all channels: (5, unit_samples) - [MV, AV, PV, TV, mask]
+        multi_wav = torch.stack(position_audios, dim=0)
+        
+        return multi_wav
     
     def get_label(self, index):
+        """Get label for given index"""
         return self.labels[index]
     
     def __getitem__(self, index):
+        """
+        Returns (wav, label) format compatible with BaseRawAudioDataset
+        wav shape: (5, unit_samples)
+        """
         if self.return_filename:
             patient_id, combo_id = self.samples[index]
-            return f"patient_{patient_id}_combo_{combo_id}"
-            
-        # Get multi-position audio and mask
-        audio_data, mask = self.get_multiposition_audio(index)
+            filename = f"patient_{patient_id}_combo_{combo_id}"
+            label = self.get_label(index)
+            return filename if label is None else (filename, label)
+        
+        # Get multi-position audio with mask (already includes length normalization)
+        wav = self.get_audio(index)  # Shape: (5, unit_samples)
         label = self.get_label(index)
         
-        # Return dictionary format suitable for GNN
-        return {
-            'patient_id': self.samples[index][0],
-            'MV': audio_data['MV'],
-            'AV': audio_data['AV'], 
-            'PV': audio_data['PV'],
-            'TV': audio_data['TV'],
-            'mask': mask,  # [MV, AV, PV, TV] availability mask
-            'label': label
-        }
+        # Convert to float
+        wav = wav.to(torch.float)
+        
+        # Apply transforms to audio channels (not mask channel)
+        if self.tfms is not None:
+            # Extract current mask to avoid transforming missing data
+            mask_channel = wav[4]  # Save mask channel
+            
+            # Extract mask values for each position
+            segment_length = self.unit_samples // 4
+            position_masks = []
+            for i in range(4):
+                start_idx = i * segment_length
+                mask_val = mask_channel[start_idx].item()  # Get mask value for this position
+                position_masks.append(mask_val > 0)  # True if position has data
+            
+            # Apply transforms only to positions with real data
+            for i in range(4):  # Only audio channels, not mask channel
+                if position_masks[i]:  # Only transform real audio
+                    wav[i] = self.tfms(wav[i])
+        
+        # Return (wav, label) format
+        return wav if label is None else (wav, label)
+
+    # ✅ 添加辅助方法来提取mask信息
+    def extract_mask_from_audio(self, wav):
+        """
+        Extract mask array from the 5th channel of audio tensor
+        Args:
+            wav: (5, unit_samples) tensor from __getitem__
+        Returns:
+            mask: (4,) tensor with mask values for [MV, AV, PV, TV]
+        """
+        if wav.size(0) != 5:
+            raise ValueError(f"Expected 5-channel audio, got {wav.size(0)} channels")
+        
+        mask_channel = wav[4]  # (unit_samples,)
+        segment_length = len(mask_channel) // 4
+        
+        mask = torch.zeros(4)
+        for i in range(4):
+            start_idx = i * segment_length
+            mask[i] = mask_channel[start_idx]  # Take first value of each segment
+        
+        return mask
     
-class WavDataset(BaseRawAudioDataset):
-    def __init__(self, cfg, split, holdout_fold=1, always_one_hot=False, random_crop=True, classes=None):
-        super().__init__(cfg.unit_samples, tfms=None, random_crop=random_crop, return_filename=cfg.return_filename)
-        self.cfg = cfg
-        self.split = split
+    def extract_audio_from_wav(self, wav):
+        """
+        Extract audio data from the first 4 channels
+        Args:
+            wav: (5, unit_samples) tensor from __getitem__
+        Returns:
+            audio: (4, unit_samples) tensor with audio data for [MV, AV, PV, TV]
+        """
+        if wav.size(0) != 5:
+            raise ValueError(f"Expected 5-channel audio, got {wav.size(0)} channels")
+        
+        return wav[:4]  # First 4 channels are audio data
 
-        df = pd.read_csv(cfg.task_metadata)
-        # Multi-fold, leave one out of cross varidation.
-        if 'split' not in df.columns:
-            assert 'fold' in df.columns, '.csv needs to have either "split" or "fold" column...'
-            # Mark split either 'train' or 'test', no 'val' or 'valid' used in this implentation.
-            df['split'] = df.fold.apply(lambda f: 'test' if f == holdout_fold else 'train')
-        df = df[df.split == split].reset_index()
-        self.df = df
-        self.multi_label = df.label.map(str).str.contains(',').sum() > 0
-        print("self.multi_label: ", self.multi_label)
-
-        if self.multi_label or always_one_hot:
-            # one-hot
-            oh_enc = MultiLabelBinarizer()
-            self.labels = torch.tensor(oh_enc.fit_transform([str(ls).split(',') for ls in df.label]), dtype=torch.float32)
-            self.classes = oh_enc.classes_
-        else:
-            # single valued gt values
-            self.classes = sorted(df.label.unique()) if classes is None else classes
-            self.labels = torch.tensor(df.label.map({l: i for i, l in enumerate(self.classes)}).values)
-
-    def __len__(self):
-        return len(self.df)
-
-    def get_audio(self, index):
-        filename = self.cfg.task_data + '/' + self.df.file_name.values[index]
-        wav, sr = librosa.load(filename, sr=(self.cfg.sample_rate if '/original/' in self.cfg.task_data else None), mono=True)
-        wav = torch.tensor(wav).to(torch.float32)
-        assert sr == self.cfg.sample_rate, f'Invalid sampling rate: {sr} Hz, expected: {self.cfg.sample_rate} Hz.'
-        return wav
-
-    def get_label(self, index):
-        return self.labels[index]
-
-
-class ASSpectrogramDataset(WavDataset):
-    """Spectrogram audio dataset class for M2D AudioSet 2M fine-tuning."""
-
-    def __init__(self, cfg, split, always_one_hot=False, random_crop=True, classes=None):
-        super().__init__(cfg, split, holdout_fold=1, always_one_hot=always_one_hot, random_crop=random_crop, classes=classes)
-
-        self.df.file_name = self.df.file_name.str.replace('.wav', '.npy', regex=False)
-        self.folder = Path(cfg.data_path)
-        assert cfg.dur_frames == 1001, 'Set dur_frames=1001 or any number that suits your model.'
-        self.crop_frames = cfg.dur_frames
-        self.random_crop = random_crop
-
-        print(f'Dataset ({split}) contains {len(self.df)} files without normalizing stats.')
-
-    def get_audio_file(self, filename):
-        lms = torch.tensor(np.load(filename))
-        return lms
-
-    def get_audio(self, index):
-        filename = self.folder/self.df.file_name.values[index]
-        return self.get_audio_file(filename)
-
-    def complete_audio(self, lms):
-        # Trim or pad
-        start = 0
-        l = lms.shape[-1]
-        if l > self.crop_frames:
-            start = int(torch.randint(l - self.crop_frames, (1,))[0]) if self.random_crop else 0
-            lms = lms[..., start:start + self.crop_frames]
-        elif l < self.crop_frames:
-            pad_param = []
-            for i in range(len(lms.shape)):
-                pad_param += [0, self.crop_frames - l] if i == 0 else [0, 0]
-            lms = F.pad(lms, pad_param, mode='constant', value=0)
-        self.last_crop_start = start
-        lms = lms.to(torch.float)
-
-        return lms
-
-    def __getitem__(self, index):
-        lms = self.get_audio(index)
-        lms = self.complete_audio(lms)
-        # Return item
-        label = self.get_label(index)
-        return lms if label is None else (lms, label)
-
-    def __repr__(self):
-        format_string = self.__class__.__name__ + f'(crop_frames={self.crop_frames}, random_crop={self.random_crop}, '
-        return format_string
-
-
-def create_as_dataloader(cfg, batch_size, always_one_hot=False, balanced_random=False, pin_memory=True, num_workers=8):
-    batch_size = batch_size or cfg.batch_size
-    train_dataset = ASSpectrogramDataset(cfg, 'train', always_one_hot=always_one_hot, random_crop=True)
-    valid_dataset = ASSpectrogramDataset(cfg, 'valid', always_one_hot=always_one_hot, random_crop=True,
-        classes=train_dataset.classes)
-    test_dataset = ASSpectrogramDataset(cfg, 'test', always_one_hot=always_one_hot, random_crop=False,
-        classes=train_dataset.classes)
-
-    weights = pd.read_csv('evar/metadata/weight_as.csv').weight.values
-    train_sampler = WeightedRandomSampler(weights, num_samples=200000, replacement=False)
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, pin_memory=pin_memory,
-                                            num_workers=num_workers) if balanced_random else \
-                   torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=pin_memory,
-                                            num_workers=num_workers)
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin_memory,
-                                           num_workers=num_workers)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=pin_memory,
-                                           num_workers=num_workers)
-    train_loader.lms_mode = True
-
-    return (train_loader, valid_loader, test_loader, train_dataset.multi_label)
-
-
-def create_dataloader(cfg, fold=1, seed=42, batch_size=None, always_one_hot=False, balanced_random=False, pin_memory=True, num_workers=8, always_wav=False):
-    if Path(cfg.task_metadata).stem == 'as' and not always_wav:
-        return create_as_dataloader(cfg, batch_size=batch_size, always_one_hot=always_one_hot, balanced_random=balanced_random, pin_memory=pin_memory, num_workers=num_workers)
-
+def create_dataloader(cfg, fold=1, seed=42, batch_size=None, always_one_hot=False, balanced_random=False, pin_memory=True, num_workers=8):
     batch_size = batch_size or cfg.batch_size
     train_dataset = WavDataset_paired(cfg, 'train', holdout_fold=fold, always_one_hot=always_one_hot, random_crop=True)
     valid_dataset = WavDataset_paired(cfg, 'valid', holdout_fold=fold, always_one_hot=always_one_hot, random_crop=True,

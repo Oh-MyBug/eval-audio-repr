@@ -127,3 +127,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+/app/circor/physionet.org
+/logs
+/m2d_vit_base-80x608p16x16-221006-mr7
+/evar/metadata
+/MurmurGraphNet/logs
+/work
+*.zip
+/m2d_clap_vit_base-80x1001p16x16-240128_AS-FT_enconly

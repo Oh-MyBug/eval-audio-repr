@@ -1,24 +1,26 @@
 """Fine-tuning evaluator.
 """
-
-from evar.common import (sys, np, pd, EasyDict, kwarg_cfg,
-    torch, F, logging, append_to_csv, app_setup_logger, seed_everything, RESULT_DIR)
+import os
 import fire
 import time
-from sklearn import metrics, utils
-
+import torch
+import logging
 import torchaudio
-import timm.scheduler
 import timm.optim
+import evar.ar_m2d
+import numpy as np
+import pandas as pd
+import timm.scheduler
+import torch.nn.functional as F
 
-from evar.data import create_dataloader
-from evar.model_utils import set_layers_trainable, show_layers_trainable, MLP
-from lineareval import *
+from torch import nn
+from sklearn import metrics
+from easydict import EasyDict
 from MurmurGraphNet.model.GraphNet import MSTGCN
-
+from MurmurGraphNet.utils.utils import make_cfg, kwarg_cfg, app_setup_logger, append_to_csv, RESULT_DIR
+from MurmurGraphNet.dataloader.data import create_dataloader
 
 torch.backends.cudnn.benchmark = True
-
 
 # copied and modified from https://github.com/nttcslab/byol-a
 import random
@@ -163,49 +165,18 @@ class Mixup(object):
         x_and_y = [do_mixup(z, self.lambdas) for z in x_and_y]
         return x_and_y
 
-
 def evaluate(model, loader, device, eval_fn, classes):
     model.eval()
-    all_probs, all_gts = [], []
-    
+    all_probs, all_gts= [], []
     for batch in loader:
         with torch.no_grad():
-            # ✅ 处理字典格式的batch
-            batch_device = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                for k, v in batch.items()
-            }
-            
-            # ✅ 解包模型输出（处理可能的aux_loss）
-            model_output = model(batch_device)
-            if isinstance(model_output, tuple):
-                probs, _ = model_output  # 忽略aux_loss
-            else:
-                probs = model_output
-            
-            # ✅ 提取标签
-            y_gt = batch_device['label']
-            
-            # 保存结果
+            X, y_gt = batch
+            probs, __, __ = model(X.to(device))
             all_probs.append(probs.detach().cpu().numpy())
-            all_gts.append(y_gt.detach().cpu().numpy())
-    
+        all_gts.append(y_gt.numpy())
     y_score = np.vstack(all_probs)
     y_true = np.vstack(all_gts)
     return eval_fn(y_score, y_true, classes)
-
-# def evaluate(model, loader, device, eval_fn, classes):
-#     model.eval()
-#     all_probs, all_gts= [], []
-#     for batch in loader:
-#         with torch.no_grad():
-#             X, y_gt = batch
-#             all_probs.append(model(X.to(device)).detach().cpu().numpy())
-#         all_gts.append(y_gt.numpy())
-#     y_score = np.vstack(all_probs)
-#     y_true = np.vstack(all_gts)
-#     return eval_fn(y_score, y_true, classes)
-
 
 def arg_conf_str(args, defaults={
     'lr': (0.0, 'lr', 'z'),
@@ -238,18 +209,6 @@ def arg_conf_str(args, defaults={
             value = value[:1]
         confstr += arg_key + value
     return confstr
-
-def move_batch_to_device(batch, device):
-    """将batch字典中的张量数据移动到指定设备"""
-    batch_device = {}
-    
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            batch_device[key] = value.to(device)
-        else:
-            batch_device[key] = value  # 保持非张量数据不变
-    
-    return batch_device
 
 def _train(cfg, ar_model, device, logpath, train_loader, valid_loader, test_loader, loss_fn, multi_label, seed, lr, balanced, verbose):
     classes = train_loader.dataset.classes
@@ -290,22 +249,30 @@ def _train(cfg, ar_model, device, logpath, train_loader, valid_loader, test_load
         'optim': cfg.optim, 'unit_sec': cfg.unit_sec}))
 
     for epoch in range(cfg.ft_epochs):
+        # Train
+        ar_model.train()
         for iter, batch in enumerate(train_loader):
-            # Train
-            ar_model.train()
-            if cfg.mixup == 0:
-                batch_device = move_batch_to_device(batch, device)
-                probs, loss2 = ar_model(batch_device)
-                loss = loss_fn(probs, batch_device['label']) + loss2
+            # ✅ 方案2: 解包(wav, label)格式
+            if len(batch) == 2:
+                batch_wav, batch_labels = batch
             else:
-                audio_tensor = torch.stack([batch['MV'], batch['AV'], batch['PV'], batch['TV']], dim=1)
-                X_aug, y_aug = mixup([audio_tensor, batch['label']])
-                # X_aug, y_aug = mixup(batch)
+                batch_wav = batch
+                batch_labels = None
+            
+            # Move to device
+            batch_wav = batch_wav.to(device)        # (batch_size, 5, unit_samples)
+            batch_labels = batch_labels.to(device) if batch_labels is not None else None
+
+            if cfg.mixup == 0:
+                probs, loss1, loss2 = ar_model(batch_wav)
+                loss = loss_fn(probs, batch_labels) + loss1 + loss2
+            else:
+                X_aug, y_aug = mixup(batch)
                 if not isinstance(X_aug, list):
                     X_aug, y_aug = X_aug.to(device), y_aug.to(device)
 
-                probs, loss2 = ar_model(X_aug)
-                loss = loss_fn(probs, y_aug) + loss2
+                probs, loss1, loss2 = ar_model(X_aug)
+                loss = loss_fn(probs, y_aug) + loss1 + loss2
             
             loss.backward()
             optimizer.step()
@@ -361,18 +328,19 @@ def _train(cfg, ar_model, device, logpath, train_loader, valid_loader, test_load
 
     return best_result, best_path, name
 
+def set_layers_trainable(layer, trainable=False):
+    for n, p in layer.named_parameters():
+        p.requires_grad = trainable
 
-class TaskHead(torch.nn.Module):
-    def __init__(self, dim, n_class=1000, hidden=()):
-        super().__init__()
-        self.norm = torch.nn.BatchNorm1d(dim, affine=False)
-        self.mlp = MLP(input_size=dim, hidden_sizes=hidden, output_size=n_class, mean=0.0, std=0.01, bias=0.)
-
-    def forward(self, x):
-        x = self.norm(x.unsqueeze(-1)).squeeze(-1)
-        return self.mlp(x)
-
-
+def show_layers_trainable(layer, show_all_trainable=True):
+    total_params = sum(p.numel() for p in layer.parameters())
+    total_trainable_params = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+    print(f'Total number of parameters: {total_params:,} (trainable {total_trainable_params:,})')
+    trainable = [n for n, p in layer.named_parameters() if p.requires_grad]
+    frozen = [n for n, p in layer.named_parameters() if not p.requires_grad]
+    print('Trainable parameters:', trainable if show_all_trainable else f'{trainable[:10]} ...')
+    print('Others are frozen such as:', frozen[:3], '...' if len(frozen) >= 3 else '')
+    
 class TaskNetwork(torch.nn.Module):
     def __init__(self, cfg, ar):
         super().__init__()
@@ -390,17 +358,25 @@ class TaskNetwork(torch.nn.Module):
         print('Head:')
         show_layers_trainable(self.head)
 
-    # def forward(self, batch_audio):
-    #     x = self.ar(batch_audio)
-    #     x = self.head(x)
-    #     return x # returning logits, not probs
-    def forward(self, batch_data):
+    def forward(self, batch_wav):
         """
-        batch_data: dict with keys ['MV', 'AV', 'PV', 'TV', 'mask', 'label']
-        Each position audio shape: (batch_size, audio_length)
+        Args:
+            batch_wav: (batch_size, 5, unit_samples) tensor where:
+                - batch_wav[:, 0] = MV audio
+                - batch_wav[:, 1] = AV audio  
+                - batch_wav[:, 2] = PV audio
+                - batch_wav[:, 3] = TV audio
+                - batch_wav[:, 4] = mask channel (segmented mask info)
         """
-        batch_size = batch_data['MV'].shape[0]
-        mask = batch_data['mask']  # (batch_size, 4) - [MV, AV, PV, TV]
+        batch_size, num_channels, unit_samples = batch_wav.shape
+        assert num_channels == 5, f"Expected 5 channels, got {num_channels}"
+        
+        # ✅ 提取音频数据和mask信息
+        audio_data = batch_wav[:, :4]  # (batch_size, 4, unit_samples) - [MV, AV, PV, TV]
+        mask_channel = batch_wav[:, 4]  # (batch_size, unit_samples) - mask channel
+        
+        # ✅ 从mask通道提取实际的mask矩阵
+        mask = self.extract_mask_from_channel(mask_channel)  # (batch_size, 4)
         
         # Position names corresponding to mask order
         position_names = ['MV', 'AV', 'PV', 'TV']
@@ -408,8 +384,8 @@ class TaskNetwork(torch.nn.Module):
         
         # Process each position separately through self.ar
         for i, pos in enumerate(position_names):
-            pos_audio = batch_data[pos]  # (batch_size, audio_length)
-            pos_mask = mask[:, i]        # (batch_size,)
+            pos_audio = audio_data[:, i]  # (batch_size, unit_samples)
+            pos_mask = mask[:, i]         # (batch_size,)
             
             # Extract features using self.ar
             if pos_mask.sum() > 0:  # At least some samples have this position
@@ -423,9 +399,16 @@ class TaskNetwork(torch.nn.Module):
                 
             else:
                 # All samples missing this position - create zero features
-                # Get D and T from a reference (assuming consistent across positions)
-                # Or use predefined values from config
-                D, T = self.cfg.feature_d, self.cfg.num_timesteps  # You need to define these
+                # Get D and T from a reference sample (use first available position or defaults)
+                if len(position_features) > 0:
+                    # Use dimensions from previous position
+                    D, T = position_features[0].shape[1], position_features[0].shape[2]
+                else:
+                    # Fallback: run one sample to get dimensions
+                    sample_audio = audio_data[:1, 0]  # Take first position of first batch item
+                    sample_feat = self.ar(sample_audio)
+                    D, T = sample_feat.shape[1], sample_feat.shape[2]
+                    
                 pos_feat = torch.zeros(batch_size, D, T, 
                                     device=pos_audio.device, dtype=pos_audio.dtype)
             
@@ -439,9 +422,37 @@ class TaskNetwork(torch.nn.Module):
         mstgcn_input = stacked_features.permute(0, 3, 1, 2)
         
         # Forward through MSTGCN head
-        x = self.head(mstgcn_input)
+        class_out, loss1, loss2 = self.head(mstgcn_input)
         
-        return x
+        return class_out, loss1, loss2
+
+    def extract_mask_from_channel(self, mask_channel):
+        """
+        Extract position masks from mask channel
+        Args:
+            mask_channel: (batch_size, unit_samples) - segmented mask information
+        Returns:
+            mask: (batch_size, 4) - mask for [MV, AV, PV, TV]
+        """
+        batch_size, unit_samples = mask_channel.shape
+        segment_length = unit_samples // 4
+        
+        mask = torch.zeros(batch_size, 4, device=mask_channel.device)
+        
+        for i in range(4):  # 4 positions
+            start_idx = i * segment_length
+            # Take the mask value from the start of each segment
+            mask[:, i] = mask_channel[:, start_idx]
+        
+        return mask
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def run_eval(config_file, task, options='', seed=42, lr=None, hidden=(), mixup=None, batch_size=None,
                           epochs=None, early_stop_epochs=None, warmup_epochs=None,
@@ -527,7 +538,12 @@ def finetune_main(config_file, task, options='', seed=42, lr=None, hidden=(), ep
 
     score_file = logpath/f'{cfg.task_name}_{cfg.audio_repr.replace("AR_", "").replace("_", "-")}-FT_{cfg.id[-8:]}_{mean_score:.5f}.csv'
     best_report = logpath/(best_path.stem.split('_')[1] + '.csv')
+    # 如果文件已存在，添加时间戳
+    if score_file.exists():
+        timestamp = int(time.time())
+        score_file = score_file.with_stem(f"{score_file.stem}_{timestamp}")
     best_report.rename(score_file)
+
 
     if len(scores) > 1:
         report += ', scores: [' + ', '.join([f'{score:.5f}' for score in scores]) + ']'

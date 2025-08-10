@@ -1,117 +1,200 @@
 """Main solver program for CirCor evaluation.
 """
+import warnings
+warnings.filterwarnings("ignore")
 
 import sys
+import fire
+import torch
+import random
+import logging
+import torchaudio
+import numpy as np
+import pandas as pd
 sys.path.append('app/circor/heart-murmur-detection')
 sys.path.append('app/circor/heart-murmur-detection/ModelEvaluation')
 
-from evar.common import (sys, np, pd, kwarg_cfg, Path,
-    torch, logging, append_to_csv, RESULT_DIR)
-import torchaudio
-import fire
-
-from evar.data import create_dataloader
-import evar
-from lineareval import make_cfg
-from finetune import TaskNetwork, finetune_main
-
-from DataProcessing.find_and_load_patient_files import load_patient_data
-from DataProcessing.helper_code import load_recordings
-from ModelEvaluation.evaluate_model import evaluate_model
 from tqdm import tqdm
+from pathlib import Path
 from sklearn import utils
+import evar.ar_m2d
+from MurmurGraphNet.dataloader.data import create_dataloader
+from MurmurGraphNet.model.finetune import TaskNetwork, finetune_main   
+from MurmurGraphNet.utils.utils import make_cfg, load_patient_data, load_recordings, append_to_csv, kwarg_cfg, RESULT_DIR
+from MurmurGraphNet.model.evaluate_model import evaluate_model
 
 
 def infer_and_eval(cfg, model, test_root, eval_mode='follow_prior_work'):
     model.eval()
 
-    pids = sorted(list(set([f.stem.split('_')[0] for f in Path(test_root).glob('*.wav')])))  # evaluate_model.py::find_challenge_files -> sorted(os.listdir(label_folder))
+    pids = sorted(list(set([f.stem.split('_')[0] for f in Path(test_root).glob('*.wav')])))
     txt_files = [test_root+pid+'.txt' for pid in pids]
     print('Test file folder:', test_root)
     print('Test files:', pids[:2], txt_files[:2])
     softmax_fn = torch.nn.Softmax(dim=1)
     probabilities, wav_probabilities = [], []
+    
+    # ✅ 定义四个位置的顺序
+    POSITIONS = ['MV', 'AV', 'PV', 'TV']
 
     for txt in tqdm(txt_files):
-        # Load recordigns
+        # Load recordings
         data = load_patient_data(txt)
         recordings, frequencies = load_recordings(test_root, data, get_frequencies=True)
         recordings = [torch.tensor(r / 32768.).to(torch.float) for r in recordings]
 
-        # Note: No normalization of raw audio wave. Already normalized in the pipeline.
-        #   recordings[0].max() -> tensor(1.0000)
-        #   recordings[0].min() -> tensor(-1.)
-        # def normalize(wav):
-        #     return wav / (1.0e-10 + wav.abs().max())
-        # recordings = [normalize(r) for r in recordings]
-
+        # Resample all recordings to target sample rate
         wavs = [torchaudio.transforms.Resample(f, cfg.sample_rate)(r) for r, f in zip(recordings, frequencies)]
-
-        # Note: *No padding* because sample lengths are very different among recordings, for example: [164608, 150272, 105472, 460544]
-        # print([len(w) for w in wavs])
-        # max_len = max([len(w) for w in wavs])
-        # wavs = [(np.pad(w, (0, max_len - len(w)) if len(w) < max_len else w) for w in wavs)]
-
-        # Process per recording (with variable length)
-        L = cfg.unit_samples  # number of samples for 5 sec
-        logits = []
-        for wav in wavs:
-            if len(wav) < L:
-                wav = torch.nn.functional.pad(wav, (0, L - len(wav)))
-            # Split wav into 5-s segments and encode them.
-            segment_logits = []
-            for widx, pos in enumerate(range(0, len(wav) - L + 1, L)):
-                segment = wav[pos:pos+L]
-                if len(segment) < L:
-                    continue
-                with torch.no_grad():
-                    x = segment.unsqueeze(0)
-                    logit = model(x)
-                segment_logits.append(logit)       # [1, 3] for one chunk
-            # Logits for one recording wav.
-            logits.append(torch.stack(segment_logits).mean(0))
-
+        
+        # ✅ 组织成位置-录音的映射
+        position_recordings = organize_recordings_by_position(txt, wavs, test_root, data)
+        
+        # ✅ 生成四位置组合样本
+        multi_position_samples = generate_multi_position_samples(position_recordings, cfg.unit_samples)
+        
+        # Process each multi-position sample
+        L = cfg.unit_samples
+        sample_logits = []
+        
+        for multi_wav in multi_position_samples:
+            # multi_wav: (5, L) tensor - [MV, AV, PV, TV, mask_channel]
+            with torch.no_grad():
+                x = multi_wav.unsqueeze(0)  # (1, 5, L)
+                logit = model(x)  # Forward through your updated model
+                if isinstance(logit, tuple):
+                    logit = logit[0]  # Take first element if tuple returned
+            sample_logits.append(logit)
+        
+        # Average logits across all samples for this patient
+        if sample_logits:
+            avg_logits = torch.stack(sample_logits).mean(0)  # [1, num_classes]
+        else:
+            # Fallback: create zero logits
+            avg_logits = torch.zeros(1, 3)  # [1, 3] for 3 classes
+        
         # Reorder classes from ["Absent", "Present", "Unknown"] -> ["Present", "Unknown", "Absent"]
-        logits = torch.vstack(logits)
-        logits = logits[:, [1, 2, 0]]
-        # Probabilities for each wav
-        probs = logits.softmax(1).detach().to('cpu')
-        wav_probabilities.append(probs)
-        # Probability for the average logits
-        probs = logits.mean(0, keepdims=True).softmax(1).detach().to('cpu')[0]
+        avg_logits = avg_logits[:, [1, 2, 0]]
+        
+        # Get probabilities
+        probs = avg_logits.softmax(1).detach().to('cpu')[0]
         probabilities.append(probs)
+        
+        # For wav_probabilities, we'll use the same result (since we're now processing as groups)
+        wav_probabilities.append(probs.unsqueeze(0))  # Keep same format as original
 
     probabilities = torch.stack(probabilities)
- 
+    
+    # Rest of the function remains the same...
     def label_decision_rule(wav_probs):
-        # Following Panah et al. “Exploring Wav2vec 2.0 Model for Heart Murmur Detection.” EUSIPCO, 2023, pp. 1010–14.
         cidxs = torch.argmax(wav_probs, dim=1)
         PRESENT, UNKNOWN, ABSENT = 0, 1, 2
-        # - Assign present if at least one recording was classified as present.
         if PRESENT in cidxs:
             final_label = PRESENT
-        # - Assign unknown if none of the recordings was classified as present, and at least one recording was classified  as unknown.
         elif UNKNOWN in cidxs:
             final_label = UNKNOWN
-        # - Assign absent if all recordings were classified as absent.
         else:
             final_label = ABSENT
         return final_label
 
     if eval_mode is None or eval_mode == 'follow_prior_work':
-        print('Label decision follows: Panah et al. “Exploring Wav2vec 2.0 Model for Heart Murmur Detection.” EUSIPCO, 2023, pp. 1010–14.')
+        print('Label decision follows: Panah et al. "Exploring Wav2vec 2.0 Model for Heart Murmur Detection." EUSIPCO, 2023, pp. 1010–14.')
         cidxs = torch.tensor([label_decision_rule(wav_probs) for wav_probs in wav_probabilities])
     elif eval_mode == 'normal':
         print('Label decision is: torch.argmax(probabilities, dim=1)')
         cidxs = torch.argmax(probabilities, dim=1)
     else:
         assert False, f'Unknown eval_mode: {eval_mode}'
+        
     labels = torch.nn.functional.one_hot(cidxs, num_classes=3)
 
     wav_probabilities = [p.numpy() for p in wav_probabilities]
     probabilities = probabilities.numpy()
     labels = labels.numpy()
     return evaluate_model(test_root, probabilities, labels), (wav_probabilities, probabilities)
+
+
+def organize_recordings_by_position(txt_file, wavs, test_root, data):
+    """
+    组织录音文件按位置分类
+    Returns: dict {position: [wav_tensors]}
+    """
+    POSITIONS = ['MV', 'AV', 'PV', 'TV']
+    position_recordings = {pos: [] for pos in POSITIONS}
+    
+    # 从文件名中解析位置信息
+    wav_files = [f for f in Path(test_root).glob('*.wav') if f.stem.split('_')[0] == Path(txt_file).stem]
+    
+    for wav_file in wav_files:
+        parts = wav_file.stem.split('_')
+        if len(parts) >= 2:
+            position = parts[1]  # 假设格式为 patientID_position_segment.wav
+            if position in POSITIONS:
+                # 找到对应的wav tensor
+                # 这里需要根据你的具体数据加载逻辑来匹配wav_file和wavs
+                # 简化版本：按顺序匹配（你可能需要调整）
+                for i, wav in enumerate(wavs):
+                    if i < len(wav_files) and wav_file == sorted(wav_files)[i]:
+                        position_recordings[position].append(wav)
+                        break
+    
+    return position_recordings
+
+
+def generate_multi_position_samples(position_recordings, unit_samples, num_samples=10):
+    """
+    生成多位置组合样本
+    Args:
+        position_recordings: {position: [wav_tensors]}
+        unit_samples: 每个位置的目标样本长度
+        num_samples: 生成的样本数量
+    Returns:
+        List of (5, unit_samples) tensors
+    """
+    POSITIONS = ['MV', 'AV', 'PV', 'TV']
+    samples = []
+    
+    for _ in range(num_samples):
+        position_audios = []
+        mask_values = []
+        
+        for position in POSITIONS:
+            recordings = position_recordings[position]
+            
+            if recordings:
+                # 随机选择一个录音
+                selected_wav = random.choice(recordings)
+                
+                # 长度处理
+                if len(selected_wav) >= unit_samples:
+                    start = random.randint(0, len(selected_wav) - unit_samples)
+                    wav_segment = selected_wav[start:start + unit_samples]
+                else:
+                    wav_segment = torch.nn.functional.pad(selected_wav, (0, unit_samples - len(selected_wav)))
+                
+                mask_values.append(1.0)  # 有数据
+            else:
+                # 缺失位置用零填充
+                wav_segment = torch.zeros(unit_samples)
+                mask_values.append(0.0)  # 缺失
+            
+            position_audios.append(wav_segment)
+        
+        # ✅ 创建mask通道（与训练时格式一致）
+        mask_channel = torch.zeros(unit_samples)
+        segment_length = unit_samples // 4
+        
+        for i, mask_val in enumerate(mask_values):
+            start_idx = i * segment_length
+            end_idx = (i + 1) * segment_length if i < 3 else unit_samples
+            mask_channel[start_idx:end_idx] = mask_val
+        
+        position_audios.append(mask_channel)
+        
+        # 构建样本: (5, unit_samples)
+        sample = torch.stack(position_audios, dim=0)
+        samples.append(sample)
+    
+    return samples
 
 
 def eval_main(config_file, task, checkpoint, options='', seed=42, lr=None, hidden=(128,), epochs=None, early_stop_epochs=None, warmup_epochs=None,
@@ -222,15 +305,15 @@ class WeightedCE:
         return loss
 
 
-def solve_mlp_circor(config_file, task, options='', seed=42, lr=None, hidden=(128,), epochs=None, early_stop_epochs=None, warmup_epochs=None,
+def solve_graph_circor(config_file, task, options='', seed=42, lr=None, hidden=(128,), epochs=None, early_stop_epochs=None, warmup_epochs=None,
                   mixup=None, freq_mask=None, time_mask=None, rrc=None, training_mask=None, batch_size=None,
-                  optim='adamw', unit_sec=None, verbose=False, data_path='work', eval_only=None, eval_mode=None, reweight=True, save_prob=None):
+                  optim='sgd', unit_sec=None, verbose=False, data_path='work', eval_only=f'MurmurGraphNet\logs\m2d_vit_base-80x608p16x16-221006-mr7-checkpoint-300_circor1_88c4bcf4\weights_ep22it47-0.73368_loss7.9553.pth', eval_mode=None, reweight=True, save_prob=None):
 
     assert task in [f'circor{n}' for n in range(1, 3+1)]
     # We train a model using the original fine-tuner from the EVAR (finetune_main), and the best_path holds the path of the best weight.
     # This part is the same training process as what we have been doing in BYOL-A and M2D.
     if eval_only is None:
-        cfg, n_folds, balanced = make_cfg(config_file, task, options, extras={}, abs_unit_sec=unit_sec)
+        cfg, __, balanced = make_cfg(config_file, task, options, extras={}, abs_unit_sec=unit_sec)
         train_loader, _, _, _ = create_dataloader(cfg, fold=0, seed=0, batch_size=1, balanced_random=balanced, pin_memory=False)
         #labels = np.argmax(train_loader.dataset.labels, axis=1)  # One-hot to numbers
         labels = train_loader.dataset.labels.numpy()
@@ -251,4 +334,4 @@ def solve_mlp_circor(config_file, task, options='', seed=42, lr=None, hidden=(12
 
 
 if __name__ == '__main__':
-    fire.Fire(solve_mlp_circor)
+    fire.Fire(solve_graph_circor)

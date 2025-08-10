@@ -160,7 +160,6 @@ def make_cfg(config_file, task, options, extras={}, cancel_aug=False, abs_unit_s
     # Statistics for normalization
     if 'mean' not in cfg:
         cfg['mean'] = cfg['std'] = None
-
     return cfg, n_folds, balanced
 
 
